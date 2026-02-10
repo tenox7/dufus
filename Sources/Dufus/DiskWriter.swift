@@ -23,9 +23,10 @@ class DiskWriter {
                   let daDisk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, disk.id) else {
                 self.setStatus("Eject failed"); return
             }
-            DASessionScheduleWithRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            let rl = CFRunLoopGetCurrent()!
+            DASessionScheduleWithRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue)
             let ok = self.waitDA { cb, ctx in DADiskEject(daDisk, DADiskEjectOptions(kDADiskEjectOptionDefault), cb, ctx) }
-            DASessionUnscheduleFromRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            DASessionUnscheduleFromRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue)
             self.setStatus(ok ? "Ejected" : "Eject failed")
         }
     }
@@ -117,9 +118,10 @@ class DiskWriter {
     private func unmount(disk: DiskInfo) -> Bool {
         guard let session = DASessionCreate(kCFAllocatorDefault),
               let daDisk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, disk.id) else { return false }
-        DASessionScheduleWithRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        let rl = CFRunLoopGetCurrent()!
+        DASessionScheduleWithRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue)
         let ok = waitDA { cb, ctx in DADiskUnmount(daDisk, DADiskUnmountOptions(kDADiskUnmountOptionWhole | kDADiskUnmountOptionForce), cb, ctx) }
-        DASessionUnscheduleFromRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        DASessionUnscheduleFromRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue)
         return ok
     }
 

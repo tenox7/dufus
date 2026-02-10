@@ -19,9 +19,10 @@ let package = Package(
                 .linkedLibrary("lzma"),
             ]
         ),
+        .target(name: "CLzip"),
         .executableTarget(
             name: "Dufus",
-            dependencies: ["CWipefs", "CDecompressors"],
+            dependencies: ["CWipefs", "CDecompressors", "CLzip"],
             linkerSettings: [
                 .linkedFramework("IOKit"),
             ]

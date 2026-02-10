@@ -1,14 +1,16 @@
 import Foundation
 import CDecompressors
+import CLzip
 
 enum Compression {
-    case none, gzip, xz, bz2
+    case none, gzip, xz, bz2, lzip
 
     init?(ext: String) {
         switch ext.lowercased() {
         case "gz": self = .gzip
         case "xz": self = .xz
         case "bz2": self = .bz2
+        case "lz": self = .lzip
         default: return nil
         }
     }
@@ -29,21 +31,15 @@ class ImageReader {
     private var zStrm = z_stream()
     private var xzStrm = lzma_stream()
     private var bzStrm = bz_stream()
+    private var lzDec = CLzmaDec()
+    private var lzAvailIn = 0
+    private var lzInOffset = 0
 
     var compressedBytesRead: UInt64 { fileHandle.offsetInFile }
 
     init?(url: URL) {
         let ext = url.pathExtension.lowercased()
-        let stripped = url.deletingPathExtension().pathExtension.lowercased()
-
-        if let c = Compression(ext: ext),
-           Compression.rawExtensions.contains(stripped) || !stripped.isEmpty {
-            compression = c
-        } else if Compression.rawExtensions.contains(ext) || Compression(ext: ext) == nil {
-            compression = .none
-        } else {
-            compression = .none
-        }
+        compression = Compression(ext: ext) ?? .none
 
         guard let fh = FileHandle(forReadingAtPath: url.path) else { return nil }
         fileHandle = fh
@@ -69,6 +65,7 @@ class ImageReader {
         case .gzip:  return readGzip()
         case .xz:    return readXz()
         case .bz2:   return readBz2()
+        case .lzip:  return readLzip()
         }
     }
 
@@ -78,6 +75,7 @@ class ImageReader {
         case .gzip:  inflateEnd(&zStrm)
         case .xz:    lzma_end(&xzStrm)
         case .bz2:   BZ2_bzDecompressEnd(&bzStrm)
+        case .lzip:  LzmaDec_Free(&lzDec)
         }
         fileHandle.closeFile()
         inputBuf.deallocate()
@@ -97,6 +95,8 @@ class ImageReader {
             return lzma_stream_decoder(&xzStrm, UInt64.max, UInt32(LZMA_CONCATENATED)) == LZMA_OK
         case .bz2:
             return BZ2_bzDecompressInit(&bzStrm, 0, 0) == BZ_OK
+        case .lzip:
+            return initLzipMember()
         }
     }
 
@@ -174,6 +174,59 @@ class ImageReader {
             if ret == BZ_STREAM_END { finished = true }
             if produced > 0 { return Data(bytes: outputBuf, count: produced) }
             if ret != BZ_OK { finished = true; return nil }
+        }
+    }
+
+    // MARK: - Lzip
+
+    private func initLzipMember() -> Bool {
+        let hdr = fileHandle.readData(ofLength: 6)
+        guard hdr.count == 6,
+              hdr[0] == 0x4C, hdr[1] == 0x5A, hdr[2] == 0x49, hdr[3] == 0x50,
+              hdr[4] == 1 else { return false }
+        var ds = UInt32(1) << (hdr[5] & 0x1F)
+        if ds > UInt32(min_dictionary_size) {
+            ds -= (ds / 16) * UInt32((hdr[5] >> 5) & 7)
+        }
+        var props: [UInt8] = [93,
+            UInt8(ds & 0xFF), UInt8((ds >> 8) & 0xFF),
+            UInt8((ds >> 16) & 0xFF), UInt8((ds >> 24) & 0xFF)]
+        return LzmaDec_Init(&lzDec, &props)
+    }
+
+    private func nextLzipMember() -> Bool {
+        LzmaDec_Free(&lzDec)
+        lzDec = CLzmaDec()
+        let pos = fileHandle.offsetInFile - UInt64(lzAvailIn)
+        fileHandle.seek(toFileOffset: pos + 20)
+        lzAvailIn = 0
+        lzInOffset = 0
+        return initLzipMember()
+    }
+
+    private func readLzip() -> Data? {
+        while true {
+            if lzAvailIn == 0 {
+                let data = fileHandle.readData(ofLength: inputBufSize)
+                if data.isEmpty { finished = true; return nil }
+                data.copyBytes(to: inputBuf, count: data.count)
+                lzInOffset = 0
+                lzAvailIn = data.count
+            }
+            var srcLen = UInt32(lzAvailIn)
+            var destLen = UInt32(outputBufSize)
+            var status = LZMA_STATUS_NOT_SPECIFIED
+            let ok = LzmaDec_DecodeToBuf(&lzDec, outputBuf, &destLen,
+                                          inputBuf.advanced(by: lzInOffset), &srcLen,
+                                          LZMA_FINISH_ANY, &status)
+            lzInOffset += Int(srcLen)
+            lzAvailIn -= Int(srcLen)
+
+            if status == LZMA_STATUS_FINISHED_WITH_MARK {
+                if !nextLzipMember() { finished = true }
+            }
+            if destLen > 0 { return Data(bytes: outputBuf, count: Int(destLen)) }
+            if !ok { finished = true; return nil }
         }
     }
 }

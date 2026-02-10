@@ -11,6 +11,7 @@ struct DufusApp: App {
                     appState.imageURL = url
                 }
                 .onAppear {
+                    appState.imageURL = nil
                     handleCommandLineArgs()
                 }
         }
