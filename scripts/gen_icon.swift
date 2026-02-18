@@ -30,7 +30,7 @@ for (name, px) in entries {
     let img = NSImage(size: NSSize(width: s, height: s))
     img.lockFocus()
 
-    let inset = s * 0.03
+    let inset = s * 0.10
     let rect = NSRect(x: inset, y: inset, width: s - inset * 2, height: s - inset * 2)
     let r = s * 0.22
     let bg = NSBezierPath(roundedRect: rect, xRadius: r, yRadius: r)
