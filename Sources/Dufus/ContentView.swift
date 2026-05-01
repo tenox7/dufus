@@ -14,12 +14,14 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 16) {
             dropZone
             HStack {
-                Picker("Target Disk:", selection: $selectedDisk) {
+                Picker("", selection: $selectedDisk) {
                     Text("Select a disk…").tag(nil as DiskInfo?)
                     ForEach(diskManager.disks) { disk in
                         Text(disk.displayName).tag(disk as DiskInfo?)
                     }
                 }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
                 Button("⟳") {
                     diskManager.refresh()
                 }
