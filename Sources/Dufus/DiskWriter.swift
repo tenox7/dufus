@@ -18,15 +18,20 @@ class DiskWriter {
 
     func eject(disk: DiskInfo) {
         DispatchQueue.global(qos: .userInitiated).async {
-            self.setStatus("Ejecting…")
+            self.setStatus("Unmounting…")
             guard let session = DASessionCreate(kCFAllocatorDefault),
                   let daDisk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, disk.id) else {
                 self.setStatus("Eject failed"); return
             }
             let rl = CFRunLoopGetCurrent()!
             DASessionScheduleWithRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue)
+            defer { DASessionUnscheduleFromRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue) }
+            let unmounted = self.waitDA { cb, ctx in
+                DADiskUnmount(daDisk, DADiskUnmountOptions(kDADiskUnmountOptionWhole | kDADiskUnmountOptionForce), cb, ctx)
+            }
+            guard unmounted else { self.setStatus("Failed to unmount"); return }
+            self.setStatus("Ejecting…")
             let ok = self.waitDA { cb, ctx in DADiskEject(daDisk, DADiskEjectOptions(kDADiskEjectOptionDefault), cb, ctx) }
-            DASessionUnscheduleFromRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue)
             self.setStatus(ok ? "Ejected" : "Eject failed")
         }
     }
