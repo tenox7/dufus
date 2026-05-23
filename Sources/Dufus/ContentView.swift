@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var showFilePicker = false
     @State private var dropHighlight = false
     @State private var wipeBeforeWrite = true
+    @State private var autoEject = true
     private var writer: DiskWriter { DiskWriter(appState: appState) }
 
     var body: some View {
@@ -27,12 +28,13 @@ struct ContentView: View {
                 }
             }
             Toggle("Wipe filesystem signatures before write", isOn: $wipeBeforeWrite)
+            Toggle("Eject after write", isOn: $autoEject)
             Spacer()
             progressSection
             HStack {
                 Button("Write") {
                     guard let image = appState.imageURL, let disk = selectedDisk else { return }
-                    writer.write(image: image, to: disk, wipe: wipeBeforeWrite)
+                    writer.write(image: image, to: disk, wipe: wipeBeforeWrite, autoEject: autoEject)
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(appState.imageURL == nil || selectedDisk == nil || appState.writing)
@@ -49,7 +51,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
         }
         .padding(20)
-        .frame(width: 350, height: 300)
+        .frame(width: 350, height: 360)
         .onAppear {
             diskManager.refresh()
         }

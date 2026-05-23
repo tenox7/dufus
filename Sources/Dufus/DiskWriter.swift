@@ -10,57 +10,65 @@ class DiskWriter {
         self.appState = appState
     }
 
-    func write(image: URL, to disk: DiskInfo, wipe: Bool) {
+    func write(image: URL, to disk: DiskInfo, wipe: Bool, autoEject: Bool) {
         DispatchQueue.global(qos: .userInitiated).async {
-            self.run(image: image, disk: disk, wipe: wipe)
+            guard self.run(image: image, disk: disk, wipe: wipe) else { return }
+            if autoEject { self.ejectDisk(disk) }
         }
     }
 
     func eject(disk: DiskInfo) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.setStatus("Unmounting…")
-            guard let session = DASessionCreate(kCFAllocatorDefault),
-                  let daDisk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, disk.id) else {
-                self.setStatus("Eject failed"); return
-            }
-            let rl = CFRunLoopGetCurrent()!
-            DASessionScheduleWithRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue)
-            defer { DASessionUnscheduleFromRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue) }
-            let unmounted = self.waitDA { cb, ctx in
-                DADiskUnmount(daDisk, DADiskUnmountOptions(kDADiskUnmountOptionWhole | kDADiskUnmountOptionForce), cb, ctx)
-            }
-            guard unmounted else { self.setStatus("Failed to unmount"); return }
-            self.setStatus("Ejecting…")
-            let ok = self.waitDA { cb, ctx in DADiskEject(daDisk, DADiskEjectOptions(kDADiskEjectOptionDefault), cb, ctx) }
-            self.setStatus(ok ? "Ejected" : "Eject failed")
-        }
+        DispatchQueue.global(qos: .userInitiated).async { self.ejectDisk(disk) }
     }
 
-    private func run(image: URL, disk: DiskInfo, wipe: Bool) {
+    private func ejectDisk(_ disk: DiskInfo) {
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { setStatus("Eject failed"); return }
+        let rl = CFRunLoopGetCurrent()!
+        DASessionScheduleWithRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue)
+        defer { DASessionUnscheduleFromRunLoop(session, rl, CFRunLoopMode.defaultMode.rawValue) }
+
+        setStatus("Ejecting…")
+        let devPath = "/dev/\(disk.id)"
+        for attempt in 0..<6 {
+            if access(devPath, F_OK) != 0 { setStatus("Ejected"); return }
+            if let daDisk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, disk.id) {
+                let unmounted = waitDA { cb, ctx in
+                    DADiskUnmount(daDisk, DADiskUnmountOptions(kDADiskUnmountOptionWhole | kDADiskUnmountOptionForce), cb, ctx)
+                }
+                if unmounted, waitDA(op: { cb, ctx in DADiskEject(daDisk, DADiskEjectOptions(kDADiskEjectOptionDefault), cb, ctx) }) {
+                    setStatus("Ejected"); return
+                }
+            }
+            if attempt < 5 { Thread.sleep(forTimeInterval: 1) }
+        }
+        setStatus("Eject failed")
+    }
+
+    private func run(image: URL, disk: DiskInfo, wipe: Bool) -> Bool {
         appState.cancelled = false
         DispatchQueue.main.async { self.appState.writing = true }
         defer { DispatchQueue.main.async { self.appState.writing = false } }
 
         setStatus("Unmounting…")
-        guard unmount(disk: disk) else { setStatus("Failed to unmount"); return }
+        guard unmount(disk: disk) else { setStatus("Failed to unmount"); return false }
 
         let rawPath = "/dev/r\(disk.id)"
         setStatus("Requesting authorization…")
-        guard let fd = openWithAuth(rawPath) else { setStatus("Failed to open \(rawPath)"); return }
+        guard let fd = openWithAuth(rawPath) else { setStatus("Failed to open \(rawPath)"); return false }
         defer { close(fd) }
 
         if wipe {
             setStatus("Wiping signatures…")
             var ctx: OpaquePointer?
             var err = wipefs_alloc(fd, 0, &ctx)
-            guard err == 0, let wipeCtx = ctx else { setStatus("wipefs init failed"); return }
+            guard err == 0, let wipeCtx = ctx else { setStatus("wipefs init failed"); return false }
             err = wipefs_wipe(wipeCtx)
             var mctx: OpaquePointer? = wipeCtx
             wipefs_free(&mctx)
-            guard err == 0 else { setStatus("wipefs failed: \(err)"); return }
+            guard err == 0 else { setStatus("wipefs failed: \(err)"); return false }
         }
 
-        guard let reader = ImageReader(url: image) else { setStatus("Cannot open image"); return }
+        guard let reader = ImageReader(url: image) else { setStatus("Cannot open image"); return false }
         defer { reader.close() }
 
         setStatus("Writing…")
@@ -75,17 +83,17 @@ class DiskWriter {
             buf.append(chunk)
             while buf.count >= blockSize {
                 if written + UInt64(blockSize) > diskSize {
-                    setStatus("Image too large for disk"); return
+                    setStatus("Image too large for disk"); return false
                 }
                 let block = buf.prefix(blockSize)
                 guard writeChunk(block, fd: fd, offset: written) else {
                     setStatus("Write error at offset \(written): \(errnoMessage())")
-                    return
+                    return false
                 }
                 written += UInt64(blockSize)
                 buf.removeFirst(blockSize)
                 updateWriteStatus(written: written, reader: reader, startTime: startTime)
-                if appState.cancelled { setStatus("Cancelled at \(formatBytes(written))"); return }
+                if appState.cancelled { setStatus("Cancelled at \(formatBytes(written))"); return false }
             }
         }
 
@@ -96,7 +104,7 @@ class DiskWriter {
             buf = buf.prefix(toWrite)
             guard writeChunk(buf, fd: fd, offset: written) else {
                 setStatus("Write error at offset \(written): \(errnoMessage())")
-                return
+                return false
             }
             written += UInt64(buf.count)
         }
@@ -104,6 +112,7 @@ class DiskWriter {
         _ = fcntl(fd, F_FULLFSYNC)
         setProgress(1)
         setStatus("Done — \(formatBytes(written)) written")
+        return true
     }
 
     private func writeChunk(_ data: Data, fd: Int32, offset: UInt64) -> Bool {
@@ -148,12 +157,19 @@ class DiskWriter {
         return ctx.pointee ?? false
     }
 
+    private static var sharedAuth: AuthorizationRef?
+
+    private static func authRef() -> AuthorizationRef? {
+        if let auth = sharedAuth { return auth }
+        var ref: AuthorizationRef?
+        guard AuthorizationCreate(nil, nil, [], &ref) == errAuthorizationSuccess else { return nil }
+        sharedAuth = ref
+        return ref
+    }
+
     private func openWithAuth(_ path: String) -> Int32? {
         let right = "sys.openfile.readwrite.\(path)"
-        var authRef: AuthorizationRef?
-        let status = AuthorizationCreate(nil, nil, [], &authRef)
-        guard status == errAuthorizationSuccess, let auth = authRef else { return nil }
-        defer { AuthorizationFree(auth, []) }
+        guard let auth = DiskWriter.authRef() else { return nil }
 
         let authorized: Bool = right.withCString { ptr in
             var item = AuthorizationItem(name: ptr, valueLength: 0, value: nil, flags: 0)
