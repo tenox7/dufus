@@ -51,6 +51,10 @@ release: icon binary
 	$(call bundle,--options runtime --timestamp --sign "$(DEV_ID)")
 	$(call build_dmg,$(DMG))
 	codesign --force --timestamp --sign "$(DEV_ID)" $(DMG)
+	@# hdiutil sometimes leaves a diskimages-helper with a lock on the DMG; notarytool then hangs forever
+	@for p in $$(lsof -t $(DMG) 2>/dev/null); do \
+		ps -o comm= -p $$p | grep -q diskimages-helper && { echo "killing stale diskimages-helper $$p"; kill -9 $$p; }; \
+	done; true
 	xcrun notarytool submit $(DMG) --keychain-profile "$(NOTARY_PROFILE)" --wait
 	xcrun stapler staple $(DMG)
 	@echo "Signed + notarized: $(DMG)"
