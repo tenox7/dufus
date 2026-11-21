@@ -29,6 +29,27 @@ class DiskManager: ObservableObject {
         disks = Self.listPhysicalDisks()
     }
 
+    /// True when the file is on a volume of the whole disk `bsd`, also through an APFS container.
+    static func file(_ path: String, isOn bsd: String) -> Bool {
+        var fs = statfs()
+        guard statfs(path, &fs) == 0 else { return false }
+        let from = withUnsafeBytes(of: &fs.f_mntfromname) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+        guard from.hasPrefix("/dev/disk") else { return false }
+        var entry = IOServiceGetMatchingService(kIOMainPortDefault, IOBSDNameMatching(kIOMainPortDefault, 0, String(from.dropFirst(5))))
+        while entry != 0 {
+            let name = IORegistryEntryCreateCFProperty(entry, "BSD Name" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? String
+            if name == bsd {
+                IOObjectRelease(entry)
+                return true
+            }
+            var parent: io_object_t = 0
+            let kr = IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent)
+            IOObjectRelease(entry)
+            entry = kr == KERN_SUCCESS ? parent : 0
+        }
+        return false
+    }
+
     private static func listPhysicalDisks() -> [DiskInfo] {
         guard let matching = IOServiceMatching("IOMedia") as NSMutableDictionary? else { return [] }
         matching["Whole"] = true

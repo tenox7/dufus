@@ -49,6 +49,16 @@ class DiskWriter {
         DispatchQueue.main.async { self.appState.writing = true }
         defer { DispatchQueue.main.async { self.appState.writing = false } }
 
+        // Check the image before anything touches the disk.
+        if DiskManager.file(image.path, isOn: disk.id) {
+            setStatus("Image is on the target disk"); return false
+        }
+        guard let reader = ImageReader(url: image) else { setStatus("Cannot open image"); return false }
+        defer { reader.close() }
+        if reader.compression == .none && reader.compressedSize > disk.size {
+            setStatus("Image too large for disk"); return false
+        }
+
         setStatus("Unmounting…")
         guard unmount(disk: disk) else { setStatus("Failed to unmount"); return false }
 
@@ -66,9 +76,6 @@ class DiskWriter {
             wipefs_free(&mctx)
             guard err == 0 else { setStatus("wipefs failed: \(err)"); return false }
         }
-
-        guard let reader = ImageReader(url: image) else { setStatus("Cannot open image"); return false }
-        defer { reader.close() }
 
         setStatus("Writing…")
         setProgress(0)
@@ -97,10 +104,11 @@ class DiskWriter {
         }
 
         if !buf.isEmpty {
+            guard UInt64(buf.count) <= diskSize - written else {
+                setStatus("Image too large for disk"); return false
+            }
             let aligned = (buf.count + 511) & ~511
-            let toWrite = min(aligned, Int(diskSize - written))
-            buf.append(contentsOf: [UInt8](repeating: 0, count: max(0, toWrite - buf.count)))
-            buf = buf.prefix(toWrite)
+            buf.append(contentsOf: [UInt8](repeating: 0, count: aligned - buf.count))
             guard writeChunk(buf, fd: fd, offset: written) else {
                 setStatus("Write error at offset \(written): \(errnoMessage())")
                 return false
