@@ -56,7 +56,9 @@ struct ContentView: View {
             diskManager.refresh()
         }
         .onChange(of: diskManager.disks) { newDisks in
-            if newDisks.count == 1 { selectedDisk = newDisks.first }
+            // A disk that went away must not stay selected: another disk can get its /dev name.
+            if let current = selectedDisk, !newDisks.contains(current) { selectedDisk = nil }
+            if selectedDisk == nil, newDisks.count == 1 { selectedDisk = newDisks.first }
         }
         .fileImporter(
             isPresented: $showFilePicker,
