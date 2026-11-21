@@ -72,7 +72,7 @@ struct ContentView: View {
     private var progressSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             ProgressView(value: appState.progress)
-                .scaleEffect(y: 4, anchor: .center)
+                .progressViewStyle(BarProgressStyle())
             Text(appState.status)
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -132,5 +132,23 @@ struct ContentView: View {
         UTType("public.zip-archive") ?? .data,
         UTType("com.apple.disk-image") ?? .data,
     ]
+}
+
+// Fixed-height bar. Scaling the native bar distorts it and its size differs per macOS version.
+private struct BarProgressStyle: ProgressViewStyle {
+    var height: CGFloat = 12
+
+    func makeBody(configuration: Configuration) -> some View {
+        let fraction = min(max(configuration.fractionCompleted ?? 0, 0), 1)
+        return GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Rectangle().fill(.quaternary)
+                Rectangle().fill(Color.accentColor)
+                    .frame(width: geo.size.width * fraction)
+            }
+        }
+        .frame(height: height)
+        .clipShape(Capsule())
+    }
 }
 
