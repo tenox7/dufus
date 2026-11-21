@@ -21,6 +21,14 @@ let package = Package(
         ),
         .target(name: "CLzip"),
         .executableTarget(
+            name: "DufusHelper",
+            linkerSettings: [
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("Security"),
+            ]
+        ),
+        .executableTarget(
             name: "Dufus",
             dependencies: ["CWipefs", "CDecompressors", "CLzip"],
             linkerSettings: [

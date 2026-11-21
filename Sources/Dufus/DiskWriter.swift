@@ -53,8 +53,7 @@ class DiskWriter {
         guard unmount(disk: disk) else { setStatus("Failed to unmount"); return false }
 
         let rawPath = "/dev/r\(disk.id)"
-        setStatus("Requesting authorization…")
-        guard let fd = openWithAuth(rawPath) else { setStatus("Failed to open \(rawPath)"); return false }
+        guard let fd = openDisk(rawPath) else { setStatus("Failed to open \(rawPath)"); return false }
         defer { close(fd) }
 
         if wipe {
@@ -167,6 +166,18 @@ class DiskWriter {
         return ref
     }
 
+    /// Opens the disk via the installed helper (no prompt), else via authopen (admin prompt).
+    private func openDisk(_ path: String) -> Int32? {
+        if Helper.isInstalled {
+            setStatus("Opening disk…")
+            if let fd = receiveFD(from: Helper.installedPath, arguments: [path]) { return fd }
+            setStatus("Helper refused, requesting authorization…")
+        } else {
+            setStatus("Requesting authorization…")
+        }
+        return openWithAuth(path)
+    }
+
     private func openWithAuth(_ path: String) -> Int32? {
         let right = "sys.openfile.readwrite.\(path)"
         guard let auth = DiskWriter.authRef() else { return nil }
@@ -183,30 +194,39 @@ class DiskWriter {
 
         var extForm = AuthorizationExternalForm()
         guard AuthorizationMakeExternalForm(auth, &extForm) == errAuthorizationSuccess else { return nil }
+        let input = withUnsafeBytes(of: &extForm) { Data($0) }
+        return receiveFD(from: "/usr/libexec/authopen",
+                         arguments: ["-stdoutpipe", "-extauth", "-o", "2", path], input: input)
+    }
 
+    /// Runs a tool that sends an open descriptor back over stdout (SCM_RIGHTS), like `authopen -stdoutpipe`.
+    private func receiveFD(from tool: String, arguments: [String], input: Data? = nil) -> Int32? {
         var fds: [Int32] = [0, 0]
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else { return nil }
 
         let stdinPipe = Pipe()
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/libexec/authopen")
-        proc.arguments = ["-stdoutpipe", "-extauth", "-o", "2", path]
+        proc.executableURL = URL(fileURLWithPath: tool)
+        proc.arguments = arguments
         proc.standardOutput = FileHandle(fileDescriptor: fds[1], closeOnDealloc: false)
-        proc.standardInput = stdinPipe
+        if input != nil { proc.standardInput = stdinPipe }
 
         do { try proc.run() } catch { close(fds[0]); close(fds[1]); return nil }
         close(fds[1])
 
-        withUnsafeBytes(of: &extForm) { buf in
-            stdinPipe.fileHandleForWriting.write(Data(buf))
+        if let input {
+            stdinPipe.fileHandleForWriting.write(input)
+            stdinPipe.fileHandleForWriting.closeFile()
         }
-        stdinPipe.fileHandleForWriting.closeFile()
 
         let fd = recv_fd(fds[0])
         close(fds[0])
         proc.waitUntilExit()
 
-        guard proc.terminationStatus == 0, fd >= 0 else { return nil }
+        guard proc.terminationStatus == 0, fd >= 0 else {
+            if fd >= 0 { close(fd) }
+            return nil
+        }
         return fd
     }
 

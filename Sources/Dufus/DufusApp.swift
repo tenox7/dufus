@@ -34,6 +34,29 @@ struct DufusApp: App {
         }
         .defaultSize(width: 350, height: 500)
         .windowResizability(.contentSize)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Divider()
+                Button(appState.helperInstalled ? "Reinstall Disk Helper…" : "Install Disk Helper…") {
+                    changeHelper(install: true)
+                }
+                Button("Uninstall Disk Helper…") {
+                    changeHelper(install: false)
+                }
+                .disabled(!appState.helperInstalled)
+            }
+        }
+    }
+
+    private func changeHelper(install: Bool) {
+        appState.status = install ? "Installing disk helper…" : "Removing disk helper…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let error = install ? Helper.install() : Helper.uninstall()
+            DispatchQueue.main.async {
+                appState.helperInstalled = Helper.isInstalled
+                appState.status = error ?? (install ? "Disk helper installed, no more password prompts" : "Disk helper removed")
+            }
+        }
     }
 
     private func handleCommandLineArgs() {
@@ -50,5 +73,6 @@ class AppState: ObservableObject {
     @Published var progress: Double = 0
     @Published var status: String = "Ready"
     @Published var writing: Bool = false
+    @Published var helperInstalled = Helper.isInstalled
     var cancelled: Bool = false
 }

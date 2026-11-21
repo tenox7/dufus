@@ -19,13 +19,19 @@ $(BUILD)/AppIcon.icns: scripts/gen_icon.swift
 binary:
 	swift build -c release --arch arm64 --arch x86_64
 
-app: icon binary
+# $(1) = codesign options. The helper is signed first, with its own identifier.
+define bundle
 	@rm -rf $(APP)
 	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp Resources/Info.plist $(APP)/Contents/
 	cp $(BUILD)/AppIcon.icns $(APP)/Contents/Resources/
-	cp $(BIN_PATH)/Dufus $(APP)/Contents/MacOS/
-	codesign --force --deep --sign - $(APP)
+	cp $(BIN_PATH)/Dufus $(BIN_PATH)/DufusHelper $(APP)/Contents/MacOS/
+	codesign --force $(1) --identifier com.github.tenox7.dufus.helper $(APP)/Contents/MacOS/DufusHelper
+	codesign --force $(1) $(APP)
+endef
+
+app: icon binary
+	$(call bundle,--sign -)
 
 define build_dmg
 	@rm -rf $(STAGING) $(1)
@@ -42,12 +48,7 @@ dmg: app
 release: icon binary
 	@test -n "$(DEV_ID)" || { echo "DEV_ID not set — copy .env.example to .env and fill in"; exit 1; }
 	@test -n "$(NOTARY_PROFILE)" || { echo "NOTARY_PROFILE not set — copy .env.example to .env and fill in"; exit 1; }
-	@rm -rf $(APP)
-	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
-	cp Resources/Info.plist $(APP)/Contents/
-	cp $(BUILD)/AppIcon.icns $(APP)/Contents/Resources/
-	cp $(BIN_PATH)/Dufus $(APP)/Contents/MacOS/
-	codesign --force --deep --options runtime --timestamp --sign "$(DEV_ID)" $(APP)
+	$(call bundle,--options runtime --timestamp --sign "$(DEV_ID)")
 	$(call build_dmg,$(DMG))
 	codesign --force --timestamp --sign "$(DEV_ID)" $(DMG)
 	xcrun notarytool submit $(DMG) --keychain-profile "$(NOTARY_PROFILE)" --wait
