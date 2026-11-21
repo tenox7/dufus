@@ -5,15 +5,21 @@
 // Like `authopen -stdoutpipe`, it opens one disk read/write and sends the
 // descriptor back over stdout (a unix socket). All data still flows through
 // the app. It refuses unless:
+//   - the path is /dev/rdiskN (a whole raw disk),
 //   - the user is an admin,
 //   - the caller is Dufus, signed by the same team as this helper,
-//   - the disk is a whole disk with removable media (no fixed HDD/SSD, no disk image),
+//   - the disk is a physical whole disk with removable media (SD/CF cards, most USB sticks):
+//     no fixed HDD or SSD, no disk image, no synthesized (APFS) disk,
 //   - no volume of the disk is mounted (this also protects the boot disk).
+// The checks run as the user. Only the open() runs as root, then the helper drops root for good
+// and checks the opened disk again, so a disk swapped in meanwhile cannot slip through.
 // `DufusHelper --check /dev/rdiskN` runs the checks without opening the disk.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/storage/IOMedia.h>
+#include <IOKit/storage/IOStorageProtocolCharacteristics.h>
 #include <Security/Security.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,6 +30,7 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -101,9 +108,31 @@ static io_service_t media_named(const char *bsd) {
     return IOServiceGetMatchingService(kIOMainPortDefault, IOBSDNameMatching(kIOMainPortDefault, 0, bsd));
 }
 
+// The provider of `e`, or 0. Releases `e`.
+static io_registry_entry_t parent_of(io_registry_entry_t e) {
+    io_registry_entry_t parent;
+    if (IORegistryEntryGetParentEntry(e, kIOServicePlane, &parent) != KERN_SUCCESS) parent = 0;
+    IOObjectRelease(e);
+    return parent;
+}
+
 static int prop_true(io_registry_entry_t e, CFStringRef key) {
     CFTypeRef v = IORegistryEntryCreateCFProperty(e, key, NULL, 0);
     int r = v && CFEqual(v, kCFBooleanTrue);
+    if (v) CFRelease(v);
+    return r;
+}
+
+static int prop_int(io_registry_entry_t e, CFStringRef key, int *out) {
+    CFTypeRef v = IORegistryEntryCreateCFProperty(e, key, NULL, 0);
+    int r = v && CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, out);
+    if (v) CFRelease(v);
+    return r;
+}
+
+static int name_is(io_registry_entry_t e, CFStringRef name) {
+    CFTypeRef v = IORegistryEntryCreateCFProperty(e, CFSTR(kIOBSDNameKey), NULL, 0);
+    int r = v && CFEqual(v, name);
     if (v) CFRelease(v);
     return r;
 }
@@ -113,58 +142,86 @@ static int dict_has(CFDictionaryRef d, CFStringRef key, CFStringRef value) {
     return v && CFEqual(v, value);
 }
 
-// Whole disk with removable media (SD/CF cards, most USB sticks), not a disk image.
-// Fixed disks are refused, internal or external (HDD, SSD, Time Machine), even when ejectable.
-static int disk_allowed(io_service_t media) {
-    if (!prop_true(media, CFSTR("Whole")) || !prop_true(media, CFSTR("Removable"))) return 0;
-    io_registry_entry_t e = media, parent;
-    IOObjectRetain(e);
-    int ok = 0;
-    while (IORegistryEntryGetParentEntry(e, kIOServicePlane, &parent) == KERN_SUCCESS) {
-        IOObjectRelease(e);
-        e = parent;
-        if (!IOObjectConformsTo(e, "IOBlockStorageDevice")) continue;
-        CFTypeRef pc = IORegistryEntryCreateCFProperty(e, CFSTR("Protocol Characteristics"), NULL, 0);
-        if (pc && CFGetTypeID(pc) == CFDictionaryGetTypeID())
-            ok = !dict_has(pc, CFSTR("Physical Interconnect"), CFSTR("Virtual Interface")) &&
-                 !dict_has(pc, CFSTR("Physical Interconnect"), CFSTR("Disk Image"));
-        if (pc) CFRelease(pc);
-        break;
+// A physical whole disk sits right on its driver and device: IOMedia <- IOBlockStorageDriver <- IOBlockStorageDevice,
+// and the device has a real interconnect. Disk images have a virtual device (and say they are removable).
+// Synthesized disks (APFS containers) sit on a partition, not on a driver.
+static int physical_disk(io_registry_entry_t media) {
+    IOObjectRetain(media);
+    io_registry_entry_t driver = parent_of(media);
+    if (!driver) return 0;
+    if (!IOObjectConformsTo(driver, "IOBlockStorageDriver")) {
+        IOObjectRelease(driver);
+        return 0;
     }
-    IOObjectRelease(e);
+    io_registry_entry_t device = parent_of(driver);
+    if (!device) return 0;
+    int ok = 0;
+    if (IOObjectConformsTo(device, "IOBlockStorageDevice")) {
+        CFTypeRef pc = IORegistryEntryCreateCFProperty(device, CFSTR(kIOPropertyProtocolCharacteristicsKey), NULL, 0);
+        if (pc && CFGetTypeID(pc) == CFDictionaryGetTypeID()) {
+            CFDictionaryRef d = pc;
+            CFStringRef type = CFSTR(kIOPropertyPhysicalInterconnectTypeKey);
+            CFStringRef where = CFSTR(kIOPropertyPhysicalInterconnectLocationKey);
+            ok = CFDictionaryContainsKey(d, type) &&
+                 !dict_has(d, type, CFSTR(kIOPropertyPhysicalInterconnectTypeVirtual)) &&
+                 !dict_has(d, type, CFSTR("Disk Image")) &&
+                 !dict_has(d, where, CFSTR(kIOPropertyInterconnectFileKey)) &&
+                 !dict_has(d, where, CFSTR(kIOPropertyInterconnectRAMKey));
+        }
+        if (pc) CFRelease(pc);
+    }
+    IOObjectRelease(device);
     return ok;
 }
 
-// True if media `child` is `disk` or sits on it (partition, APFS container, volume).
-static int on_disk(const char *child, CFStringRef disk) {
-    io_registry_entry_t e = media_named(child), parent;
+// True if `child` (a BSD name) is the disk `disk` or sits on it: partition, APFS container, volume.
+static int on_disk(const char *child, const char *disk) {
+    size_t n = strlen(disk);
+    if (strncmp(child, disk, n) == 0 && (child[n] == '\0' || child[n] == 's')) return 1;
+    CFStringRef name = CFStringCreateWithCString(NULL, disk, kCFStringEncodingUTF8);
+    io_registry_entry_t e = media_named(child);
     int found = 0;
     while (e && !found) {
-        CFTypeRef name = IORegistryEntryCreateCFProperty(e, CFSTR(kIOBSDNameKey), NULL, 0);
-        found = name && CFEqual(name, disk);
-        if (name) CFRelease(name);
-        if (IORegistryEntryGetParentEntry(e, kIOServicePlane, &parent) != KERN_SUCCESS) parent = 0;
-        IOObjectRelease(e);
-        e = parent;
+        found = name_is(e, name);
+        e = parent_of(e);
     }
     if (e) IOObjectRelease(e);
+    CFRelease(name);
     return found;
 }
 
-static int has_mounted_volume(const char *bsd) {
+static int has_mounted_volume(const char *disk) {
     int n = getfsstat(NULL, 0, MNT_NOWAIT);
     if (n <= 0) return 1;
-    struct statfs *mnt = calloc((size_t)n, sizeof *mnt);
+    int room = n + 16;
+    struct statfs *mnt = calloc((size_t)room, sizeof *mnt);
     if (!mnt) return 1;
-    n = getfsstat(mnt, n * (int)sizeof *mnt, MNT_NOWAIT);
-    CFStringRef disk = CFStringCreateWithCString(NULL, bsd, kCFStringEncodingUTF8);
-    int busy = n < 0;
-    for (int i = 0; i < n && !busy; i++)
-        if (strncmp(mnt[i].f_mntfromname, "/dev/disk", 9) == 0)
-            busy = on_disk(mnt[i].f_mntfromname + 5, disk);
-    CFRelease(disk);
+    n = getfsstat(mnt, room * (int)sizeof *mnt, MNT_NOWAIT);
+    int busy = n < 0 || n >= room;  // when in doubt, say busy
+    for (int i = 0; i < n && !busy; i++) {
+        const char *from = mnt[i].f_mntfromname;
+        if (strncmp(from, "/dev/", 5) == 0) from += 5;
+        if (strncmp(from, "disk", 4) == 0) busy = on_disk(from, disk);
+    }
     free(mnt);
     return busy;
+}
+
+// Why `bsd` may not be opened, or NULL if it may. `dev` gets its device number.
+static const char *check_disk(const char *bsd, dev_t *dev) {
+    io_service_t media = media_named(bsd);
+    if (!media) return "no such disk";
+    int maj, min;
+    const char *why = NULL;
+    if (!IOObjectConformsTo(media, kIOMediaClass) || !prop_int(media, CFSTR(kIOBSDMajorKey), &maj) ||
+        !prop_int(media, CFSTR(kIOBSDMinorKey), &min) || !prop_true(media, CFSTR(kIOMediaWholeKey)))
+        why = "not a whole disk";
+    else if (!prop_true(media, CFSTR(kIOMediaRemovableKey))) why = "not a removable disk";
+    else if (!physical_disk(media)) why = "not a physical disk";
+    else if (has_mounted_volume(bsd)) why = "disk has mounted volumes";
+    else *dev = makedev(maj, min);
+    IOObjectRelease(media);
+    return why;
 }
 
 static int send_fd(int sock, int fd) {
@@ -189,30 +246,42 @@ int main(int argc, char **argv) {
     for (int fd = 0; fd <= 2; fd++)
         if (fcntl(fd, F_GETFD) == -1 && open("/dev/null", O_RDWR) != fd) return 1;
 
+    // Run as the user. Root comes back only for the open() below.
+    uid_t user = getuid();
+    int root = geteuid() == 0;
+    if (root && seteuid(user) != 0) fail("cannot drop root");
+
     int check = argc == 3 && strcmp(argv[1], "--check") == 0;
     char bsd[16];
     if (argc != 2 + check || !parse_disk(argv[1 + check], bsd, sizeof bsd))
         fail("usage: DufusHelper [--check] /dev/rdiskN");
-    const char *path = argv[1 + check];
 
     if (!user_is_admin()) fail("user is not an admin");
     if (!caller_is_dufus()) fail("caller is not Dufus signed by the same team");
-    io_service_t media = media_named(bsd);
-    if (!media) fail("no such disk");
-    int allowed = disk_allowed(media);
-    IOObjectRelease(media);
-    if (!allowed) fail("not a removable disk");
-    if (has_mounted_volume(bsd)) fail("disk has mounted volumes");
+    dev_t dev = 0;
+    const char *why = check_disk(bsd, &dev);
+    if (why) fail(why);
     if (check) {
         fprintf(stderr, "DufusHelper: ok\n");
         return 0;
     }
 
-    if (geteuid() != 0) fail("not installed setuid root");
-    int fd = open(path, O_RDWR);
-    if (fd < 0) fail(strerror(errno));
+    if (!root) fail("not installed setuid root");
+    char path[32];
+    snprintf(path, sizeof path, "/dev/r%s", bsd);
+    if (seteuid(0) != 0) fail("cannot get root");
+    int fd = open(path, O_RDWR | O_NOFOLLOW);
+    int err = errno;
+    if (setuid(user) != 0) fail("cannot drop root");  // for good
+    if (fd < 0) fail(strerror(err));
+
+    // Check the disk that was really opened. The open keeps its device number in use,
+    // so if another disk took the name meanwhile, the numbers do not match.
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) fail("not a disk device");
+    why = check_disk(bsd, &dev);
+    if (why) fail(why);
+    if (st.st_rdev != dev) fail("disk changed while opening");
     if (send_fd(STDOUT_FILENO, fd) != 0) fail("cannot send descriptor");
     return 0;
 }
