@@ -8,10 +8,11 @@
     <string>Dufus</string>
     <key>CFBundleIdentifier</key>
     <string>com.github.tenox7.dufus</string>
+    <!-- The Makefile sets both versions from the git tag. -->
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>0.0.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>0.0.0</string>
     <key>CFBundleExecutable</key>
     <string>Dufus</string>
     <key>CFBundleIconFile</key>
